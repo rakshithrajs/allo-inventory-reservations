@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { withLock } from "@/lib/withLock";
 
 const RESERVATION_WINDOW_MS = 10 * 60 * 1000;
 
@@ -19,52 +20,62 @@ export async function POST(req: NextRequest) {
     }
 
     try {
-        const reservation = await prisma.$transaction(
-            async (tx) => {
-                const rows = await tx.$queryRaw<
-                    { totalUnits: number; reservedUnits: number }[]
-                >`
+        const reservation = await withLock(
+            `stock:${productId}:${warehouseId}`,
+            async () => {
+                return prisma.$transaction(
+                    async (tx) => {
+                        const rows = await tx.$queryRaw<
+                            { totalUnits: number; reservedUnits: number }[]
+                        >`
       SELECT "totalUnits", "reservedUnits"
       FROM "Stock"
       WHERE "productId" = ${productId} AND "warehouseId" = ${warehouseId}
       FOR UPDATE
     `;
-                if (rows.length === 0) {
-                    throw {
-                        code: "NOT_FOUND",
-                        status: 404,
-                        message: "Stock not found",
-                    };
-                }
+                        if (rows.length === 0) {
+                            throw {
+                                code: "NOT_FOUND",
+                                status: 404,
+                                message: "Stock not found",
+                            };
+                        }
 
-                const available = rows[0].totalUnits - rows[0].reservedUnits;
-                if (available < quantity) {
-                    throw {
-                        code: "INSUFFICIENT_STOCK",
-                        status: 409,
-                        message: "Not enough stock",
-                    };
-                }
+                        const available =
+                            rows[0].totalUnits - rows[0].reservedUnits;
+                        if (available < quantity) {
+                            throw {
+                                code: "INSUFFICIENT_STOCK",
+                                status: 409,
+                                message: "Not enough stock",
+                            };
+                        }
 
-                await tx.stock.update({
-                    where: {
-                        productId_warehouseId: { productId, warehouseId },
+                        await tx.stock.update({
+                            where: {
+                                productId_warehouseId: {
+                                    productId,
+                                    warehouseId,
+                                },
+                            },
+                            data: { reservedUnits: { increment: quantity } },
+                        });
+
+                        return tx.reservation.create({
+                            data: {
+                                productId,
+                                warehouseId,
+                                quantity,
+                                expiresAt: new Date(
+                                    Date.now() + RESERVATION_WINDOW_MS,
+                                ),
+                            },
+                        });
                     },
-                    data: { reservedUnits: { increment: quantity } },
-                });
-
-                return tx.reservation.create({
-                    data: {
-                        productId,
-                        warehouseId,
-                        quantity,
-                        expiresAt: new Date(
-                            Date.now() + RESERVATION_WINDOW_MS,
-                        ),
-                    },
-                });
+                    { isolationLevel: "Serializable" },
+                );
             },
-            { isolationLevel: "Serializable" },
+            5000,
         );
 
         return NextResponse.json(reservation, { status: 201 });
