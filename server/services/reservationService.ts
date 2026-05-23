@@ -9,6 +9,7 @@ import type { CreateReservationInput } from "@/server/validators/reservation";
 
 const RESERVATION_WINDOW_MS = 10 * 60 * 1000;
 const RESERVE_LOCK_TTL_MS = 5000;
+const RESERVE_LOCK_WAIT_MS = 5000;
 
 export async function reserve(
     input: CreateReservationInput,
@@ -77,7 +78,7 @@ export async function reserve(
                     { isolationLevel: "Serializable" },
                 );
             },
-            RESERVE_LOCK_TTL_MS,
+            { ttlMs: RESERVE_LOCK_TTL_MS, maxWaitMs: RESERVE_LOCK_WAIT_MS },
         );
     }, 201);
 }
