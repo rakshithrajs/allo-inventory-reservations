@@ -1,3 +1,4 @@
+import { ApiError } from "@/server/http/errors";
 import { redis } from "./redis";
 
 const RELEASE_SCRIPT = `
@@ -16,7 +17,11 @@ export async function withLock<T>(
     const token = crypto.randomUUID();
     const acquired = await redis.set(key, token, { nx: true, px: ttlMs });
     if (!acquired) {
-        throw { code: "LOCK_CONTENTION", status: 409, message: "Try again" };
+        throw new ApiError(
+            "LOCK_CONTENTION",
+            "Another request is in flight for this resource",
+            409,
+        );
     }
     try {
         return await fn();

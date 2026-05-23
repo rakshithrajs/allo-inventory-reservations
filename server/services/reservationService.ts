@@ -1,99 +1,54 @@
 import { prisma } from "@/lib/prisma";
 import { withLock } from "@/lib/withLock";
+import {
+    ApiError,
+    toServiceResult,
+    type ServiceResult,
+} from "@/server/http/errors";
+import type { CreateReservationInput } from "@/server/validators/reservation";
 
 const RESERVATION_WINDOW_MS = 10 * 60 * 1000;
-
-type ReservationError = {
-    code?: string;
-    message?: string;
-    status: number;
-};
-
-type ReservationResult = {
-    status: number;
-    body: unknown;
-};
-
-type ReserveInput = {
-    productId: string;
-    warehouseId: string;
-    quantity: number;
-};
-
-function isReservationError(error: unknown): error is ReservationError {
-    return (
-        typeof error === "object" &&
-        error !== null &&
-        "status" in error &&
-        typeof (error as { status?: unknown }).status === "number"
-    );
-}
-
-function toErrorResult(error: ReservationError): ReservationResult {
-    return {
-        status: error.status,
-        body: { error: { code: error.code, message: error.message } },
-    };
-}
-
-async function withReservationErrors(
-    handler: () => Promise<ReservationResult>,
-): Promise<ReservationResult> {
-    try {
-        return await handler();
-    } catch (error: unknown) {
-        if (isReservationError(error)) {
-            return toErrorResult(error);
-        }
-
-        throw error;
-    }
-}
+const RESERVE_LOCK_TTL_MS = 5000;
 
 export async function reserve(
-    input: ReserveInput,
-): Promise<ReservationResult> {
-    return withReservationErrors(async () => {
+    input: CreateReservationInput,
+): Promise<ServiceResult> {
+    return toServiceResult(async () => {
         const { productId, warehouseId, quantity } = input;
 
-        if (!productId || !warehouseId || !quantity || quantity < 1) {
-            return {
-                status: 400,
-                body: {
-                    error: { code: "INVALID_INPUT", message: "Bad request" },
-                },
-            };
-        }
-
-        const reservation = await withLock(
+        return withLock(
             `stock:${productId}:${warehouseId}`,
             async () => {
                 return prisma.$transaction(
                     async (tx) => {
+                        // FOR UPDATE serialises concurrent reservers on the
+                        // same (productId, warehouseId) row instead of racing
+                        // the availability check.
                         const rows = await tx.$queryRaw<
                             { totalUnits: number; reservedUnits: number }[]
                         >`
-      SELECT "totalUnits", "reservedUnits"
-      FROM "Stock"
-      WHERE "productId" = ${productId} AND "warehouseId" = ${warehouseId}
-      FOR UPDATE
-    `;
+                            SELECT "totalUnits", "reservedUnits"
+                            FROM "Stock"
+                            WHERE "productId" = ${productId} AND "warehouseId" = ${warehouseId}
+                            FOR UPDATE
+                        `;
+
                         if (rows.length === 0) {
-                            throw {
-                                code: "NOT_FOUND",
-                                status: 404,
-                                message: "Stock not found",
-                            };
+                            throw new ApiError(
+                                "NOT_FOUND",
+                                "Stock not found",
+                                404,
+                            );
                         }
 
                         const available =
                             rows[0].totalUnits - rows[0].reservedUnits;
                         if (available < quantity) {
-                            throw {
-                                code: "INSUFFICIENT_STOCK",
-                                status: 409,
-                                message: "Not enough stock",
-                            };
+                            throw new ApiError(
+                                "INSUFFICIENT_STOCK",
+                                "Not enough stock",
+                                409,
+                            );
                         }
 
                         await tx.stock.update({
@@ -103,7 +58,9 @@ export async function reserve(
                                     warehouseId,
                                 },
                             },
-                            data: { reservedUnits: { increment: quantity } },
+                            data: {
+                                reservedUnits: { increment: quantity },
+                            },
                         });
 
                         return tx.reservation.create({
@@ -120,55 +77,51 @@ export async function reserve(
                     { isolationLevel: "Serializable" },
                 );
             },
-            5000,
+            RESERVE_LOCK_TTL_MS,
         );
-
-        return {
-            status: 201,
-            body: reservation,
-        };
-    });
+    }, 201);
 }
 
-export async function confirm(id: string): Promise<ReservationResult> {
-    return withReservationErrors(async () => {
-        const result = await prisma.$transaction(async (tx) => {
-            const r = await tx.reservation.findUnique({ where: { id } });
-            if (!r) {
-                throw {
-                    code: "NOT_FOUND",
-                    status: 404,
-                    message: "Reservation not found",
-                };
+export async function confirm(id: string): Promise<ServiceResult> {
+    return toServiceResult(async () => {
+        return prisma.$transaction(async (tx) => {
+            const reservation = await tx.reservation.findUnique({
+                where: { id },
+            });
+
+            if (!reservation) {
+                throw new ApiError(
+                    "NOT_FOUND",
+                    "Reservation not found",
+                    404,
+                );
             }
-            if (r.status === "CONFIRMED") {
-                return r;
+            if (reservation.status === "CONFIRMED") return reservation;
+            if (reservation.status !== "PENDING") {
+                throw new ApiError(
+                    "ALREADY_RELEASED",
+                    "Reservation is not pending",
+                    409,
+                );
             }
-            if (r.status !== "PENDING") {
-                throw {
-                    code: "ALREADY_RELEASED",
-                    status: 409,
-                    message: "Not pending",
-                };
-            }
-            if (r.expiresAt < new Date()) {
-                throw {
-                    code: "RESERVATION_EXPIRED",
-                    status: 410,
-                    message: "Expired",
-                };
+            if (reservation.expiresAt < new Date()) {
+                throw new ApiError(
+                    "RESERVATION_EXPIRED",
+                    "Reservation has expired",
+                    410,
+                );
             }
 
             await tx.stock.update({
                 where: {
                     productId_warehouseId: {
-                        productId: r.productId,
-                        warehouseId: r.warehouseId,
+                        productId: reservation.productId,
+                        warehouseId: reservation.warehouseId,
                     },
                 },
                 data: {
-                    totalUnits: { decrement: r.quantity },
-                    reservedUnits: { decrement: r.quantity },
+                    totalUnits: { decrement: reservation.quantity },
+                    reservedUnits: { decrement: reservation.quantity },
                 },
             });
 
@@ -177,53 +130,47 @@ export async function confirm(id: string): Promise<ReservationResult> {
                 data: { status: "CONFIRMED" },
             });
         });
-
-        return {
-            status: 200,
-            body: result,
-        };
     });
 }
 
-export async function release(id: string): Promise<ReservationResult> {
-    return withReservationErrors(async () => {
-        const result = await prisma.$transaction(async (tx) => {
-            const r = await tx.reservation.findUnique({ where: { id } });
-            if (!r) {
-                throw {
-                    code: "NOT_FOUND",
-                    status: 404,
-                    message: "Reservation not found",
-                };
+export async function release(id: string): Promise<ServiceResult> {
+    return toServiceResult(async () => {
+        return prisma.$transaction(async (tx) => {
+            const reservation = await tx.reservation.findUnique({
+                where: { id },
+            });
+
+            if (!reservation) {
+                throw new ApiError(
+                    "NOT_FOUND",
+                    "Reservation not found",
+                    404,
+                );
             }
-            if (r.status === "RELEASED") {
-                return r;
+            if (reservation.status === "RELEASED") return reservation;
+            if (reservation.status === "CONFIRMED") {
+                throw new ApiError(
+                    "CANNOT_RELEASE_CONFIRMED",
+                    "Cannot release a confirmed reservation",
+                    409,
+                );
             }
-            if (r.status === "CONFIRMED") {
-                throw {
-                    code: "CANNOT_RELEASE_CONFIRMED",
-                    status: 409,
-                    message: "cannot release confirmed",
-                };
-            }
-            if (r.status !== "PENDING") {
-                throw {
-                    code: "ALREADY_FINALIZED",
-                    status: 409,
-                    message: "Not pending",
-                };
+            if (reservation.status !== "PENDING") {
+                throw new ApiError(
+                    "ALREADY_FINALIZED",
+                    "Reservation is not pending",
+                    409,
+                );
             }
 
             await tx.stock.update({
                 where: {
                     productId_warehouseId: {
-                        productId: r.productId,
-                        warehouseId: r.warehouseId,
+                        productId: reservation.productId,
+                        warehouseId: reservation.warehouseId,
                     },
                 },
-                data: {
-                    reservedUnits: { decrement: r.quantity },
-                },
+                data: { reservedUnits: { decrement: reservation.quantity } },
             });
 
             return tx.reservation.update({
@@ -231,10 +178,5 @@ export async function release(id: string): Promise<ReservationResult> {
                 data: { status: "RELEASED" },
             });
         });
-
-        return {
-            status: 200,
-            body: result,
-        };
     });
 }

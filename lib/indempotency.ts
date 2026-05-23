@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import { NextRequest, NextResponse } from "next/server";
+import { apiError } from "@/server/http/errors";
 import { prisma } from "./prisma";
 
 export async function withIdempotency(
@@ -25,14 +26,10 @@ export async function withIdempotency(
             existing.endpoint !== endpoint ||
             existing.requestHash !== requestHash
         ) {
-            return NextResponse.json(
-                {
-                    error: {
-                        code: "IDEMPOTENCY_MISMATCH",
-                        message: "Key reused with different request",
-                    },
-                },
-                { status: 422 },
+            return apiError(
+                "IDEMPOTENCY_MISMATCH",
+                "Idempotency-Key was reused with a different request",
+                422,
             );
         }
         return NextResponse.json(existing.responseBody, {
