@@ -18,40 +18,74 @@ export async function POST(req: NextRequest) {
         );
     }
 
-    const stock = await prisma.stock.findUnique({
-        where: { productId_warehouseId: { productId, warehouseId } },
-    });
-    if (!stock)
-        return NextResponse.json(
-            { error: { code: "NOT_FOUND", message: "Stock not found" } },
-            { status: 404 },
-        );
+    try {
+        const reservation = await prisma.$transaction(
+            async (tx) => {
+                const rows = await tx.$queryRaw<
+                    { totalUnits: number; reservedUnits: number }[]
+                >`
+      SELECT "totalUnits", "reservedUnits"
+      FROM "Stock"
+      WHERE "productId" = ${productId} AND "warehouseId" = ${warehouseId}
+      FOR UPDATE
+    `;
+                if (rows.length === 0) {
+                    throw {
+                        code: "NOT_FOUND",
+                        status: 404,
+                        message: "Stock not found",
+                    };
+                }
 
-    const available = stock.totalUnits - stock.reservedUnits;
-    if (available < quantity) {
-        return NextResponse.json(
-            {
-                error: {
-                    code: "INSUFFICIENT_STOCK",
-                    message: "Not enough stock",
-                },
+                const available = rows[0].totalUnits - rows[0].reservedUnits;
+                if (available < quantity) {
+                    throw {
+                        code: "INSUFFICIENT_STOCK",
+                        status: 409,
+                        message: "Not enough stock",
+                    };
+                }
+
+                await tx.stock.update({
+                    where: {
+                        productId_warehouseId: { productId, warehouseId },
+                    },
+                    data: { reservedUnits: { increment: quantity } },
+                });
+
+                return tx.reservation.create({
+                    data: {
+                        productId,
+                        warehouseId,
+                        quantity,
+                        expiresAt: new Date(
+                            Date.now() + RESERVATION_WINDOW_MS,
+                        ),
+                    },
+                });
             },
-            { status: 409 },
+            { isolationLevel: "Serializable" },
         );
+
+        return NextResponse.json(reservation, { status: 201 });
+    } catch (e: unknown) {
+        if (
+            typeof e === "object" &&
+            e !== null &&
+            "status" in e &&
+            typeof (e as { status?: unknown }).status === "number"
+        ) {
+            const error = e as {
+                code?: string;
+                message?: string;
+                status: number;
+            };
+            return NextResponse.json(
+                { error: { code: error.code, message: error.message } },
+                { status: error.status },
+            );
+        }
+
+        throw e;
     }
-
-    await prisma.stock.update({
-        where: { productId_warehouseId: { productId, warehouseId } },
-        data: { reservedUnits: { increment: quantity } },
-    });
-    const reservation = await prisma.reservation.create({
-        data: {
-            productId,
-            warehouseId,
-            quantity,
-            expiresAt: new Date(Date.now() + RESERVATION_WINDOW_MS),
-        },
-    });
-
-    return NextResponse.json(reservation, { status: 201 });
 }
