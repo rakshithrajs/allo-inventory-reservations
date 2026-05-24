@@ -8,32 +8,12 @@ import {
 } from "@/components/ui/card";
 
 import { ReserveButton } from "@/components/ReserveButton";
+import { listProductsWithStock } from "@/server/services/productService";
 
-async function getProducts() {
-    const res = await fetch(
-        `${process.env.NEXT_PUBLIC_BASE_URL ?? "http://localhost:3000"}/api/products`,
-        { cache: "no-store" },
-    );
-    if (!res.ok) throw new Error("Failed to load products");
-    return res.json();
-}
-
-type StockRow = {
-    warehouseId: string;
-    warehouseCode: string;
-    warehouseName: string;
-    availableUnits: number;
-};
-
-type ProductRow = {
-    id: string;
-    sku: string;
-    name: string;
-    stockByWarehouse: StockRow[];
-};
+export const dynamic = "force-dynamic";
 
 export default async function Home() {
-    const products = (await getProducts()) as ProductRow[];
+    const products = await listProductsWithStock();
     return (
         <main className="mx-auto flex min-h-screen max-w-5xl flex-col gap-8 px-4 py-8 sm:px-6 lg:px-8">
             <section className="space-y-3">
