@@ -1,6 +1,6 @@
 # Allo Stock Manager
 
-A multi-warehouse inventory and reservation API + UI for the Allo Engineering take-home. Built on **Next.js 16 (App Router)**, **TypeScript**, **Prisma 7**, **Postgres (Neon)**, **Upstash Redis**, **Zod**, **Tailwind**, and **shadcn/ui**.
+A multi-warehouse inventory and reservation API + UI for the Allo Engineering take-home. Built on **Next.js 16 (App Router)**, **TypeScript**, **Prisma 7**, **Postgres (Neon)**, **Upstash Redis**, **Upstash QStash**, **Zod**, **Tailwind**, and **shadcn/ui**.
 
 ## What it does
 
@@ -12,20 +12,20 @@ When a customer clicks **Reserve**, the system holds a unit for 10 minutes. If t
 2. Click **Reserve 1** → you land on `/reservations/<id>` with a live 10-minute countdown.
 3. **Confirm purchase** → permanently consumes 1 unit; the home page updates without a manual refresh.
 4. **Cancel** → releases the unit immediately.
-5. Idle for 10 minutes → the unit returns to the pool via the cron job (or the next product-list read, whichever happens first).
+5. Idle for 10 minutes → the unit returns to the pool via the QStash schedule (or the next product-list read, whichever happens first).
 
 ## Local setup
 
-Requires Node 20+. Postgres is hosted (Neon free tier); Redis is hosted (Upstash free tier).
+Requires Node 20+. Postgres is hosted (Neon free tier); Redis and QStash are hosted (Upstash free tier).
 
 ```bash
-# 1. install
+# 1. install (postinstall runs prisma generate automatically)
 npm install
 
 # 2. env
 cp .env.example .env
-# fill in DATABASE_URL (Neon) + UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN
-# (NEXT_PUBLIC_BASE_URL is only needed if running on a non-default origin)
+# fill in DATABASE_URL (Neon) + UPSTASH_REDIS_REST_* (Upstash)
+# QStash vars are only required in production; locally use CRON_SECRET instead.
 
 # 3. database
 npx prisma migrate deploy
@@ -36,55 +36,63 @@ npm run dev
 # http://localhost:3000
 ```
 
-`npx prisma generate` is run automatically on `npm install` (via `postinstall`) so the typed client is always present.
+To trigger the expiry job locally:
+
+```bash
+curl -X POST http://localhost:3000/api/cron/release-expired \
+  -H "Authorization: Bearer $CRON_SECRET"
+```
 
 ### Env vars
 
-| Variable                   | Required | Purpose                                                                                                                       |
-| -------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`             | yes      | Neon Postgres connection string (their pooled URL is fine — supports session-mode pgbouncer, so migrations work through it)   |
-| `UPSTASH_REDIS_REST_URL`   | yes      | Upstash REST endpoint                                                                                                         |
-| `UPSTASH_REDIS_REST_TOKEN` | yes      | Upstash REST token                                                                                                            |
-| `NEXT_PUBLIC_BASE_URL`     | optional | Used by the Server Component product list to fetch `/api/products` on the server side. Defaults to `http://localhost:3000`.   |
+| Variable                     | Required           | Purpose                                                                                                                |
+| ---------------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`               | yes                | Neon Postgres connection string (pooled URL works; supports session-mode pgbouncer so migrations run through it)       |
+| `UPSTASH_REDIS_REST_URL`     | yes                | Upstash REST endpoint (distributed lock + idempotency cache)                                                           |
+| `UPSTASH_REDIS_REST_TOKEN`   | yes                | Upstash REST token                                                                                                     |
+| `QSTASH_CURRENT_SIGNING_KEY` | prod               | Verifies incoming QStash cron deliveries. Production must set this.                                                    |
+| `QSTASH_NEXT_SIGNING_KEY`    | prod               | Companion key for QStash key rotation.                                                                                 |
+| `CRON_SECRET`                | local              | Bearer token for manually hitting `/api/cron/release-expired` in dev. Ignored when `QSTASH_CURRENT_SIGNING_KEY` is set.|
 
 ## Architecture
 
 ```text
 app/
   api/
-    products/            GET — list products + per-warehouse available stock
-    warehouses/          GET — list warehouses
-    reservations/        POST — create reservation (with optional Idempotency-Key)
-    reservations/[id]/   GET — fetch one reservation
+    products/                  GET — list products + per-warehouse available stock
+    warehouses/                GET — list warehouses
+    reservations/              POST — create reservation (with optional Idempotency-Key)
+    reservations/[id]/         GET — fetch one reservation
     reservations/[id]/confirm  POST — confirm (idempotent)
     reservations/[id]/release  POST — release (idempotent)
-    cron/release-expired GET — Vercel Cron backstop (every 60s)
+    cron/release-expired       POST — QStash-triggered expiry sweep (signature-verified)
   reservations/[id]/page.tsx   Client component with countdown, confirm/cancel
-  page.tsx               Server component — product list with shadcn primitives
-components/ui/           shadcn primitives (Button, Card, Badge, Sonner)
+  page.tsx                     Server component — calls productService directly, no HTTP hop
+components/ui/                 shadcn primitives (Button, Card, Badge, Sonner)
 components/ReserveButton.tsx
 lib/
-  prisma.ts              Prisma client singleton with PrismaPg driver adapter
-  redis.ts               Upstash client
-  withLock.ts            Distributed lock with exponential-backoff retry
-  releaseExpired.ts      Lazy cleanup helper (also used by cron)
-  indempotency.ts        Idempotency-Key middleware
+  prisma.ts                    Prisma client singleton with PrismaPg driver adapter
+  redis.ts                     Upstash client
+  withLock.ts                  Distributed lock with exponential-backoff retry
+  releaseExpired.ts            Conditional release of expired reservations (race-safe)
+  indempotency.ts              Idempotency-Key middleware
 server/
-  http/errors.ts         ApiError class + apiError/handleApiError/toServiceResult
-  services/reservationService.ts   reserve/confirm/release business logic
-  validators/reservation.ts        Zod schema for POST body
-  types/reservation.ts             Shared API↔UI types
+  http/errors.ts               ApiError class + apiError/handleApiError/toServiceResult
+  services/productService.ts   listProductsWithStock — shared by route + page
+  services/reservationService.ts  reserve/confirm/release business logic
+  validators/reservation.ts    Zod schema for POST body
+  types/reservation.ts         Shared API↔UI types
 prisma/
-  schema.prisma          Product, Warehouse, Stock, Reservation, IdempotencyKey
-  migrations/            Generated SQL
-  seed.ts                3 products × 2 warehouses × 10 units
+  schema.prisma                Product, Warehouse, Stock, Reservation, IdempotencyKey
+  migrations/                  Generated SQL
+  seed.ts                      3 products × 2 warehouses × 10 units
 ```
 
-**Layering**: Routes are thin (parse → service → format response). Services own business logic, transactions, and lock acquisition. Repository layer was *not* introduced — duplication didn't justify it yet.
+**Layering.** Routes are thin (parse → service → format response). Services own business logic, transactions, and lock acquisition. The home page is a Server Component that calls the same service the API route uses, so there's no internal HTTP hop. A repository layer was *not* introduced — query duplication didn't justify one yet.
 
 ## Concurrency strategy
 
-This is where the assignment lives. The reservation endpoint must guarantee that for `N` available units, exactly `N` concurrent reservers succeed and the rest get 409. We use **two layers**:
+This is where the assignment lives. The reservation endpoint must guarantee that for `N` available units, exactly `N` concurrent reservers succeed and the rest get 409. Two layers cooperate:
 
 ### 1. Postgres `SELECT ... FOR UPDATE` (the actual correctness guarantee)
 
@@ -113,12 +121,26 @@ Both are transactional. Confirm checks expiry (`expiresAt < now` → 410) and pe
 
 ## Reservation expiry
 
-Two layers, same helper:
+Two layers, same helper (`releaseExpiredReservations`):
 
-- **Lazy cleanup on read.** Every call to `GET /api/products` runs `releaseExpiredReservations()` first. This means anyone hitting the home page implicitly drains the expired-reservation queue — users see fresh stock immediately, no waiting on a scheduled job.
-- **Vercel Cron backstop.** `vercel.json` schedules `GET /api/cron/release-expired` every 60 seconds. For low-traffic periods (no one browsing) this still releases held stock so it doesn't pile up.
+- **Lazy cleanup on read.** Every call to `listProductsWithStock()` (used by `GET /api/products` and the home page) sweeps expired-but-pending reservations first. Anyone browsing implicitly drains the queue, so users see fresh stock immediately without waiting for a scheduler.
+- **Upstash QStash schedule.** A QStash cron POSTs to `/api/cron/release-expired` every 2 minutes as a backstop for low-traffic periods. The endpoint verifies the `Upstash-Signature` header via `@upstash/qstash`'s `Receiver`. Locally, the same endpoint accepts a `Bearer ${CRON_SECRET}` for manual testing when QStash keys aren't configured.
 
-The cron endpoint is unauthenticated by design (see Tradeoffs). The helper is idempotent — re-releasing an already-RELEASED reservation is a no-op.
+The sweep itself is race-safe. For each candidate reservation we run a per-row transaction containing a conditional `updateMany`:
+
+```ts
+const { count } = await tx.reservation.updateMany({
+  where: { id, status: "PENDING", expiresAt: { lt: new Date() } },
+  data: { status: "RELEASED" },
+});
+if (count === 0) return; // a concurrent confirm() won — skip the stock decrement
+```
+
+Without the `status: "PENDING"` re-check, a confirm() that races between `findMany` and update would have its CONFIRMED row clobbered to RELEASED and the stock decrement applied twice. Per-row transactions also keep lock duration short so one stuck row can't block the rest of the batch.
+
+### Why QStash, not Vercel Cron
+
+Vercel's Hobby plan caps cron at one execution per day. A 2-minute schedule needs an external trigger. QStash's free tier allows 1,000 messages/day; a 2-minute schedule consumes 720/day, well within budget. Worst-case expiry-to-release latency is ~2 minutes, which is invisible against a 10-minute reservation window — and lazy cleanup on read shortens it further whenever anyone hits the home page.
 
 ## Idempotency (bonus)
 
@@ -132,7 +154,7 @@ If the client sends an `Idempotency-Key` header, the server:
 4. If the same key but a different body → returns 422 `IDEMPOTENCY_MISMATCH` (prevents a client from reusing a key for a different intent).
 5. Otherwise → runs the handler, stores the response, returns it.
 
-Persisting via Postgres (rather than Redis) gives us a permanent audit trail and survives Redis evictions. Zod validation happens before the idempotency wrapper, so a bad payload doesn't burn an idempotency slot.
+Persisting via Postgres (rather than Redis) gives a permanent audit trail and survives Redis evictions. Zod validation happens before the idempotency wrapper, so a bad payload doesn't burn an idempotency slot.
 
 ## API reference
 
@@ -142,7 +164,7 @@ All errors return:
 { "error": { "code": "CODE_NAME", "message": "Human-readable" } }
 ```
 
-Codes: `INVALID_INPUT` (400), `NOT_FOUND` (404), `INSUFFICIENT_STOCK` (409), `LOCK_CONTENTION` (409), `CANNOT_RELEASE_CONFIRMED` (409), `ALREADY_RELEASED` (409), `RESERVATION_EXPIRED` (410), `IDEMPOTENCY_MISMATCH` (422), `INTERNAL_ERROR` (500).
+Codes: `INVALID_INPUT` (400), `UNAUTHORIZED` (401), `NOT_FOUND` (404), `INSUFFICIENT_STOCK` (409), `LOCK_CONTENTION` (409), `CANNOT_RELEASE_CONFIRMED` (409), `ALREADY_RELEASED` (409), `RESERVATION_EXPIRED` (410), `IDEMPOTENCY_MISMATCH` (422), `INTERNAL_ERROR` (500).
 
 | Method | Path                            | Body                                 | Success             | Errors        |
 | ------ | ------------------------------- | ------------------------------------ | ------------------- | ------------- |
@@ -152,25 +174,28 @@ Codes: `INVALID_INPUT` (400), `NOT_FOUND` (404), `INSUFFICIENT_STOCK` (409), `LO
 | GET    | `/api/reservations/:id`         | —                                    | `200 Reservation`   | 404           |
 | POST   | `/api/reservations/:id/confirm` | —                                    | `200 Reservation`   | 404, 409, 410 |
 | POST   | `/api/reservations/:id/release` | —                                    | `200 Reservation`   | 404, 409      |
-| GET    | `/api/cron/release-expired`     | —                                    | `200 {released: N}` | —             |
+| POST   | `/api/cron/release-expired`     | —                                    | `200 {released: N}` | 401           |
 
 ## Tradeoffs and "with more time"
 
-- **No repository layer.** Stock and Reservation queries live inside `reservationService.ts`. With more code, I'd extract `server/repositories/*` to keep Prisma calls out of the service.
-- **No automated concurrency test suite.** I verified by manual `xargs -P 30` stress runs. With more time: a Vitest spec that spawns `Promise.all(50)` of reserve calls against a fixed inventory and asserts the exact success count.
-- **Cron endpoint is public.** Per the assignment's "we're not looking for a perfect production system" guidance, I left `/api/cron/release-expired` unauthenticated. The job is idempotent so abuse is harmless (extra DB load only). In production I'd verify Vercel's `x-vercel-cron-signature` header.
-- **No auth.** The whole app is single-tenant demo; no user accounts, no per-user reservation ownership.
+- **No repository layer.** Stock and Reservation queries live inside the services. With more code, I'd extract `server/repositories/*` to keep Prisma calls out of business logic.
+- **No automated concurrency test suite.** I verified by manual `xargs -P 30` stress runs (Vitest covers idempotency + happy paths). With more time: a spec that spawns `Promise.all(50)` of reserve calls against a fixed inventory and asserts the exact success count, plus a test for the expiry-vs-confirm race that motivated the conditional `updateMany`.
+- **No auth on the app itself.** Single-tenant demo — no user accounts, no per-user reservation ownership. The cron endpoint *is* signature-verified.
 - **No rate limiting** beyond the Redis lock's natural single-flight effect.
-- **Server-Component fetch loop.** `app/page.tsx` does `fetch(NEXT_PUBLIC_BASE_URL + "/api/products")` from a Server Component, which is a self-HTTP roundtrip. With more time I'd call the Prisma query directly to skip the extra hop.
+- **2-minute expiry cadence.** Constrained by QStash's free-tier 1,000-messages/day cap. Pay-as-you-go ($1 per 100K) would allow per-minute. Lazy cleanup masks the cadence for any user who hits the home page.
 - **Redis lock is debatable.** Postgres `FOR UPDATE` alone gives the correctness guarantee. The Redis layer reduces wasted DB work under heavy contention but adds Upstash latency. Left in to demonstrate distributed-systems thinking, but a pure-Postgres setup would be equally correct and simpler to operate.
 
 ## Deploy (Vercel + Neon + Upstash)
 
 1. Push to GitHub.
 2. **Neon** — create a Postgres project, copy the connection string. Run `DATABASE_URL=<prod_url> npx prisma migrate deploy && npx prisma db seed` from your machine to provision the schema and seed data.
-3. **Upstash** — create a Redis database, copy `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
-4. **Vercel** — Add the project, paste all four env vars (`DATABASE_URL`, `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, plus optionally `NEXT_PUBLIC_BASE_URL=https://<your-vercel-domain>`), deploy.
-5. The `vercel.json` cron schedule is picked up automatically.
+3. **Upstash Redis** — create a Redis database, copy `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
+4. **Upstash QStash** — copy `QSTASH_CURRENT_SIGNING_KEY` and `QSTASH_NEXT_SIGNING_KEY` from the QStash console (these are separate from QStash's publish token; only the signing keys are needed by this app).
+5. **Vercel** — Import the GitHub repo. Add `DATABASE_URL`, `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` to **Production** env vars. Deploy.
+6. **QStash schedule** — in the QStash console → Schedules → New:
+   - Destination: `https://<your-vercel-app>.vercel.app/api/cron/release-expired`
+   - Method: `POST`
+   - Cron: `*/2 * * * *`
 
 The `postinstall: prisma generate` script in [package.json](package.json) ensures the typed client is regenerated on every Vercel build (since `app/generated/prisma` is gitignored).
 
