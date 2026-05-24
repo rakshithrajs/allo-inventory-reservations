@@ -9,12 +9,46 @@ type ExpiredReservation = {
     quantity: number;
 };
 
+// Conditional update + per-reservation transaction. The WHERE clause re-checks
+// status/expiry inside the transaction so a concurrent confirm() that wins the
+// race cannot be clobbered into RELEASED (which would double-decrement
+// reservedUnits via the stock update below).
+async function releaseOne(
+    tx: Prisma.TransactionClient,
+    reservation: ExpiredReservation,
+): Promise<boolean> {
+    const { count } = await tx.reservation.updateMany({
+        where: {
+            id: reservation.id,
+            status: "PENDING",
+            expiresAt: { lt: new Date() },
+        },
+        data: { status: "RELEASED" },
+    });
+
+    if (count === 0) return false;
+
+    await tx.stock.update({
+        where: {
+            productId_warehouseId: {
+                productId: reservation.productId,
+                warehouseId: reservation.warehouseId,
+            },
+        },
+        data: {
+            reservedUnits: { decrement: reservation.quantity },
+        },
+    });
+
+    return true;
+}
+
 export async function releaseExpiredReservations(
     tx?: Prisma.TransactionClient,
-) {
+): Promise<number> {
     const client = tx ?? prisma;
 
-    const expired = await client.reservation.findMany({
+    const expired = (await client.reservation.findMany({
         where: { status: "PENDING", expiresAt: { lt: new Date() } },
         select: {
             id: true,
@@ -22,41 +56,31 @@ export async function releaseExpiredReservations(
             warehouseId: true,
             quantity: true,
         },
-    });
+    })) as ExpiredReservation[];
 
     if (expired.length === 0) {
         return 0;
     }
 
-    const releaseInClient = async (
-        transactionClient: Prisma.TransactionClient,
-    ) => {
-        for (const reservation of expired as ExpiredReservation[]) {
-            await transactionClient.reservation.update({
-                where: { id: reservation.id },
-                data: { status: "RELEASED" },
-            });
-
-            await transactionClient.stock.update({
-                where: {
-                    productId_warehouseId: {
-                        productId: reservation.productId,
-                        warehouseId: reservation.warehouseId,
-                    },
-                },
-                data: {
-                    reservedUnits: { decrement: reservation.quantity },
-                },
-            });
-        }
-    };
+    let released = 0;
 
     if (tx) {
-        await releaseInClient(tx);
+        for (const reservation of expired) {
+            if (await releaseOne(tx, reservation)) released += 1;
+        }
     } else {
-        await prisma.$transaction(releaseInClient);
+        // Per-reservation transactions keep lock duration short and prevent
+        // one stuck row from blocking the rest of the batch.
+        for (const reservation of expired) {
+            const didRelease = await prisma.$transaction((innerTx) =>
+                releaseOne(innerTx, reservation),
+            );
+            if (didRelease) released += 1;
+        }
     }
 
-    console.log(`[expiry] released ${expired.length} reservations`);
-    return expired.length;
+    if (released > 0) {
+        console.log(`[expiry] released ${released} reservations`);
+    }
+    return released;
 }
